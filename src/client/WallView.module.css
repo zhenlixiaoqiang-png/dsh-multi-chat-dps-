@@ -37,6 +37,27 @@
   font-weight: 600;
 }
 
+.collapseBtn {
+  border: none;
+  background: none;
+  color: var(--dsw-alias-label-secondary);
+  cursor: pointer;
+  padding: 0 2px;
+  font-size: 12px;
+  line-height: 1;
+  border-radius: 4px;
+  flex: none;
+  transition: color 0.15s;
+}
+.collapseBtn:hover {
+  color: var(--dsw-alias-label-primary);
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+.collapseBtn:focus-visible {
+  outline: 2px solid var(--dsw-alias-interactive-border-focus);
+  outline-offset: 1px;
+}
+
 /* Phone-access link bar: shown under the toolbar after fetching /multi/api/link. */
 .linkBar {
   display: flex;

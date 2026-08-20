@@ -9,9 +9,12 @@ export declare const zh: {
     scan: string;
     'scan.from': string;
     'scan.to': string;
+    'scan.collapse': string;
+    'scan.expand': string;
     create: string;
     'create.pending': string;
     'create.done': string;
+    'create.isolated': string;
     'create.failed': string;
     'create.unknown': string;
     exit: string;
@@ -58,9 +61,12 @@ export declare const en: {
     scan: string;
     'scan.from': string;
     'scan.to': string;
+    'scan.collapse': string;
+    'scan.expand': string;
     create: string;
     'create.pending': string;
     'create.done': string;
+    'create.isolated': string;
     'create.failed': string;
     'create.unknown': string;
     exit: string;

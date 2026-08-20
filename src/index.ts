@@ -9,8 +9,9 @@
 
 import { execFile, spawn } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
-import { existsSync } from 'node:fs'
-import { networkInterfaces } from 'node:os'
+import { existsSync, mkdirSync, copyFileSync, symlinkSync, chmodSync } from 'node:fs'
+import { join } from 'node:path'
+import { homedir, networkInterfaces } from 'node:os'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import type {} from '@deepseek-ai/dsh-host-webserver'
@@ -229,6 +230,100 @@ function resolveLauncher(): Launcher {
 }
 
 /**
+ * The DSH home directory backing THIS process (the "primary" instance).
+ * Honors `$DSH_HOME` like the official CLI; falls back to `~/.dsh`.
+ * @returns the primary DSH_HOME path.
+ */
+function primaryDshHome(): string {
+  return process.env.DSH_HOME ?? join(homedir(), '.dsh')
+}
+
+/**
+ * The per-window DSH_HOME for a spawned instance. Every pane spawned by the
+ * wall gets its OWN home under `<primaryHome>/multi-windows/<port>/` so its
+ * storages (workspace ledger + session logs) are fully isolated: concurrent
+ * panes can no longer overwrite each other's ledger or interleave writes into
+ * the same session log (the "multi-window chat disappears / cross-pollutes"
+ * bugs caused by N instances sharing one DSH_HOME).
+ * @param port - the target instance port.
+ * @returns the isolated home path.
+ */
+function isolatedHomeDir(port: number): string {
+  return join(primaryDshHome(), 'multi-windows', String(port))
+}
+
+/**
+ * The profile files a fresh DSH home needs to boot the web profile with the
+ * same plugins as this instance. These are copied (not symlinked — DSH may
+ * rewrite them) while `node_modules` is symlinked to share installed plugins.
+ */
+const PROFILE_COPY_FILES = [
+  'package.json',
+  'cordis.yml',
+  'cordis.patch.yml',
+  'pnpm-lock.yaml',
+  'pnpm-workspace.yaml',
+] as const
+
+/**
+ * Prepare the isolated DSH_HOME for one window port. Idempotent and
+ * self-healing: every file/symlink is checked individually, so a half-created
+ * home from an interrupted earlier attempt is completed on the next call
+ * instead of being skipped. Copies the primary profile's manifest files,
+ * symlinks its `node_modules` (shared plugins), and copies credentials +
+ * settings so the new instance can use the same model providers without
+ * reconfiguration.
+ *
+ * A reused port (stopped window re-created) intentionally keeps its session
+ * history but refreshes the profile manifest + credentials from the primary,
+ * so provider config changes propagate.
+ * @param port - the target instance port.
+ * @returns the prepared home path.
+ * @throws a readable Error when the primary profile is missing or IO fails.
+ */
+function prepareIsolatedHome(port: number): string {
+  const home = isolatedHomeDir(port)
+  const primary = primaryDshHome()
+  const primaryProfile = join(primary, 'profiles', 'web')
+  if (!existsSync(primaryProfile)) {
+    throw new Error(`cannot prepare isolated window home: primary profile missing at ${primaryProfile}`)
+  }
+  const profileDir = join(home, 'profiles', 'web')
+  mkdirSync(profileDir, { recursive: true })
+  // Per-file presence check (not a directory-level gate): completes a
+  // half-initialized home instead of silently skipping it.
+  for (const name of PROFILE_COPY_FILES) {
+    const src = join(primaryProfile, name)
+    const dst = join(profileDir, name)
+    if (existsSync(src) && !existsSync(dst)) copyFileSync(src, dst)
+  }
+  const primaryModules = join(primaryProfile, 'node_modules')
+  if (existsSync(primaryModules)) {
+    const link = join(profileDir, 'node_modules')
+    if (!existsSync(link)) {
+      // Windows requires an explicit 'junction' for directory links without
+      // admin rights; POSIX uses a directory symlink.
+      symlinkSync(primaryModules, link, process.platform === 'win32' ? 'junction' : 'dir')
+    }
+  }
+  // Credentials + settings: copy when absent so provider keys survive. The
+  // credentials file carries API keys: force owner-only permissions on POSIX.
+  const copyIfAbsent = (name: string, sensitive: boolean): void => {
+    const src = join(primary, name)
+    const dst = join(home, name)
+    if (existsSync(src) && !existsSync(dst)) {
+      copyFileSync(src, dst)
+      if (sensitive && process.platform !== 'win32') {
+        try { chmodSync(dst, 0o600) } catch { /* best-effort */ }
+      }
+    }
+  }
+  copyIfAbsent('.credentials.yaml', true)
+  copyIfAbsent('settings.yaml', false)
+  return home
+}
+
+/**
  * Collect every distinct local TCP port that is listening, in ONE command
  * (not one `netstat`/`lsof` per candidate, which the old free-port scan ran
  * sequentially and could take many seconds on slow Windows boxes). Windows
@@ -257,18 +352,21 @@ async function listeningPorts(): Promise<Set<number>> {
 
 /**
  * Pick the first free port in [lo, hi] that is neither the serving port nor
- * already listening. The busy set is resolved once (a single command), then
- * scanned in memory.
+ * already listening, and not currently being spawned by a concurrent create.
+ * The busy set is resolved once (a single command), then scanned in memory.
  * @param lo - first port of the range.
  * @param hi - last port of the range.
  * @param selfPort - the port serving this wall (never chosen).
+ * @param pending - ports already handed to in-flight creates (also skipped, so
+ *   two rapid "new window" clicks never race for the same port).
  * @returns a free port, or undefined when the range is exhausted.
  */
-async function pickFreePort(lo: number, hi: number, selfPort: number): Promise<number | undefined> {
+async function pickFreePort(lo: number, hi: number, selfPort: number, pending?: ReadonlySet<number>): Promise<number | undefined> {
   const busy = await listeningPorts()
   for (let port = lo; port <= hi; port++) {
     if (port === selfPort) continue
     if (busy.has(port)) continue
+    if (pending !== undefined && pending.has(port)) continue
     return port
   }
   return undefined
@@ -289,6 +387,8 @@ async function pickFreePort(lo: number, hi: number, selfPort: number): Promise<n
  * crash or a bad bin surfaces a concrete reason instead of a bare timeout.
  * @param launcher - how to spawn the dsh CLI.
  * @param port - the port for the new instance.
+ * @param env - extra environment variables for the child (e.g. an isolated
+ *   `DSH_HOME` so the pane's storages never collide with this instance's).
  * @param timeoutMs - how long to wait before handing back ok:true.
  * @param pollMs - readiness probe interval while waiting.
  * @returns ok plus the port, or ok:false with a reason.
@@ -296,6 +396,7 @@ async function pickFreePort(lo: number, hi: number, selfPort: number): Promise<n
 async function startInstance(
   launcher: Launcher,
   port: number,
+  env?: NodeJS.ProcessEnv,
   timeoutMs = 3000,
   pollMs = 300,
 ): Promise<{ ok: boolean; port: number; error?: string }> {
@@ -304,6 +405,7 @@ async function startInstance(
     stdio: ['ignore', 'ignore', 'pipe'],
     windowsHide: true,
     shell: launcher.shell,
+    env: { ...process.env, ...env },
   })
   child.unref()
   let stderr = ''
@@ -422,6 +524,10 @@ export function apply(ctx: Context, config: MultiWallConfig = {}): void {
   const scanFrom = config.scanFrom ?? 3070
   const scanTo = config.scanTo ?? 3110
   const fixedPorts = config.ports ?? []
+  // Ports handed to in-flight `/multi/api/create` requests but not yet
+  // listening: skipping them prevents two rapid creates from racing onto the
+  // same port (and the same isolated home directory).
+  const creatingPorts = new Set<number>()
 
   // Inline gateway state: lazily started on first `/multi/api/link` call and
   // reused until the target port changes (or the instance restarts).
@@ -518,14 +624,25 @@ export function apply(ctx: Context, config: MultiWallConfig = {}): void {
       }
       const launcher = resolveLauncher()
       const selfPort = ctx.webServer.port
-      void pickFreePort(scanFrom, scanTo, selfPort).then(port => {
+      void pickFreePort(scanFrom, scanTo, selfPort, creatingPorts).then(port => {
         if (port === undefined) {
           json(res, { ok: false, error: `no free port in ${scanFrom}–${scanTo}` }, 409)
           return
         }
-        return startInstance(launcher, port).then(result => {
+        creatingPorts.add(port)
+        // Each pane gets an isolated DSH_HOME so its storages (workspace
+        // ledger + session logs) never collide with this instance's or other
+        // panes' — this is what stops "multi-window chat disappears from the
+        // list" (ledger overwrites) and "chat cross-pollution" (interleaved
+        // writes into one session log).
+        const home = prepareIsolatedHome(port)
+        return startInstance(launcher, port, { DSH_HOME: home }).then(result => {
+          creatingPorts.delete(port)
           json(res, result.ok ? { ok: true, port } : { ok: false, error: result.error }, result.ok ? 200 : 500)
           if (!result.ok) ctx.logger.warn(`multi-wall create failed: ${result.error}`)
+        }).catch((error: unknown) => {
+          creatingPorts.delete(port)
+          throw error
         })
       }).catch((error: unknown) => {
         const message = error instanceof Error ? error.message : String(error)

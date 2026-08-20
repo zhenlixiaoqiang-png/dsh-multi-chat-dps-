@@ -14,7 +14,7 @@
  * per-pane liveness arrives from /multi/api/status polls. Components never
  * see ctx — the fetch helpers are injected through the registration.
  */
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, type ChangeEvent } from 'react'
 import clsx from 'clsx'
 import {
   IconCloseOutline16, IconFullscreenOutline16, IconGlobeOutline14, IconPlusOutline16,
@@ -140,6 +140,7 @@ export function WallView({ useStore, actions, discover, probe, stop, create, lin
   const [scanFrom, setScanFrom] = useState(3070)
   const [scanTo, setScanTo] = useState(3110)
   const [colsMenuOpen, setColsMenuOpen] = useState(false)
+  const [scanCollapsed, setScanCollapsed] = useState(false)
   const [creating, setCreating] = useState(false)
   const [linkOpen, setLinkOpen] = useState(false)
   const [linkInfo, setLinkInfo] = useState<Awaited<ReturnType<WallViewProps['link']>> | null>(null)
@@ -208,7 +209,7 @@ export function WallView({ useStore, actions, discover, probe, stop, create, lin
       if (result.ok && result.port !== undefined) {
         actions.addPort(result.port)
         setAlive(current => ({ ...current, [result.port!]: true }))
-        setStatus(t('create.done').replace('{port}', String(result.port)))
+        setStatus(t('create.done').replace('{port}', String(result.port)) + ' · ' + t('create.isolated'))
       } else {
         setStatus(t('create.failed').replace('{error}', result.error ?? t('create.unknown')))
       }
@@ -268,23 +269,37 @@ export function WallView({ useStore, actions, discover, probe, stop, create, lin
     <div className={css.wall} role="region" aria-label={t('overlay.title')} data-wall-view="">
       <div className={css.toolbar}>
         <span className={css.title}>{t('overlay.title')}</span>
+        <button
+          type="button"
+          className={css.collapseBtn}
+          title={scanCollapsed ? t('scan.expand') : t('scan.collapse')}
+          onClick={() => { setScanCollapsed(c => !c) }}
+          aria-expanded={!scanCollapsed}
+          aria-label={scanCollapsed ? t('scan.expand') : t('scan.collapse')}
+        >
+          {scanCollapsed ? '▸' : '▾'}
+        </button>
         <span className={css.status}>{status}</span>
         <div className={css.controls}>
-          <label className={css.field}>{t('scan.from')}
-            <Input
-              type="number"
-              value={scanFrom}
-              onChange={e => setScanFrom(Number(e.target.value))}
-            />
-          </label>
-          <label className={css.field}>{t('scan.to')}
-            <Input
-              type="number"
-              value={scanTo}
-              onChange={e => setScanTo(Number(e.target.value))}
-            />
-          </label>
-          <Button variant="toolbar" size="sm" onClick={() => { void runDiscovery() }}>{t('scan')}</Button>
+          {!scanCollapsed && (
+            <>
+              <label className={css.field}>{t('scan.from')}
+                <Input
+                  type="number"
+                  value={scanFrom}
+                  onChange={(e: ChangeEvent<HTMLInputElement>) => setScanFrom(Number(e.target.value))}
+                />
+              </label>
+              <label className={css.field}>{t('scan.to')}
+                <Input
+                  type="number"
+                  value={scanTo}
+                  onChange={(e: ChangeEvent<HTMLInputElement>) => setScanTo(Number(e.target.value))}
+                />
+              </label>
+              <Button variant="toolbar" size="sm" onClick={() => { void runDiscovery() }}>{t('scan')}</Button>
+            </>
+          )}
           <Button
             variant="toolbar"
             size="sm"
